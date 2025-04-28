@@ -1,23 +1,8 @@
-"""
-BTC-USDT 1-Hour Prediction Bot • Railway Edition (v3.2)
-------------------------------------------------------
-Cambios respecto a v3.1:
-✓  Compatible con entornos sin AVX (tensorflow-cpu)
-✓  Almacén persistente de modelos en /workspace/models
-✓  Opción de desactivar entrenamiento (env TRAIN=0)
-✓  Reintento automático si la API de Bybit devuelve error
-✓  Logs sin buffer (python -u) y nivel INFO
-✓  Manejo de señales SIGTERM/SIGINT para un shutdown limpio
-"""
-
 import os, sys, asyncio, warnings, signal, math, time
 from datetime import datetime, timedelta, timezone
 from typing import Tuple
 
-import uvloop, nest_asyncio
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-nest_asyncio.apply()
-
+import uvloop
 import numpy as np
 import pandas as pd
 import requests
@@ -30,11 +15,11 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 from sklearn.preprocessing import StandardScaler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pybit.unified_trading import HTTP                         # Bybit SDK
+from pybit.unified_trading import HTTP  # Bybit SDK
 
-# ─────────────── Config vía env ───────────────
+# ─────────────── Configuración básica ───────────────
 TICKER               = os.getenv("TICKER",              "BTCUSDT")
-INTERVAL             = int(os.getenv("INTERVAL",               5))      # min
+INTERVAL             = int(os.getenv("INTERVAL",               5))
 LOOK_BACK            = int(os.getenv("LOOK_BACK",             60))
 PRED_HORIZON_MIN     = int(os.getenv("PRED_MIN",              60))
 LOOK_AHEAD_STEPS     = PRED_HORIZON_MIN // INTERVAL
@@ -45,29 +30,27 @@ EPOCHS               = int(os.getenv("EPOCHS",               10))
 BATCH_SIZE           = int(os.getenv("BATCH_SIZE",          128))
 RETRAIN_EVERY_HRS    = int(os.getenv("RETRAIN_HRS",          12))
 COOLDOWN_MIN_MONITOR = int(os.getenv("COOLDOWN_MIN",         10))
-DO_TRAIN             = os.getenv("TRAIN", "1") != "0"                 # ON/OFF
+DO_TRAIN             = os.getenv("TRAIN", "1") != "0"
 MODEL_DIR            = "/workspace/models"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ntfy.sh --------------------------------------------------------------------
+# ntfy.sh notifications
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "mente-sardina")
 NTFY_URL   = f"https://ntfy.sh/{NTFY_TOPIC}".rstrip("/")
 
 def ntfy_send(text: str, priority: str = "default"):
     try:
-        requests.post(NTFY_URL, data=text.encode(),
-                      headers={"Priority": priority}, timeout=10)
+        requests.post(NTFY_URL, data=text.encode(), headers={"Priority": priority}, timeout=10)
     except Exception as e:
         print(f"[ntfy] {e}", file=sys.stderr)
+
+# Use uvloop for better performance
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 # ────────────────────── 1. DATA (Bybit) ──────────────────────
 session = HTTP(testnet=False, timeout=10)
 
 def fetch_recent_klines(needed: int) -> pd.DataFrame:
-    """
-    Descarga tantas velas como se pidan (máx 1000 por llamada).
-    Hace paginación hasta cubrir 'needed'.
-    """
     frames, remaining = [], needed
     cursor = None
     while remaining > 0:
@@ -79,25 +62,21 @@ def fetch_recent_klines(needed: int) -> pd.DataFrame:
                 cursor=cursor
             )
         except Exception as e:
-            print(f"[Bybit] {e} – reintentando en 2 s", file=sys.stderr)
+            print(f"[Bybit] {e} – retrying in 2s", file=sys.stderr)
             time.sleep(2)
             continue
         data = res["result"]["list"]
         frames.append(pd.DataFrame(data))
         remaining -= limit
         cursor = res["result"].get("nextPageCursor")
-        if not cursor:                     # no hay más datos históricos
+        if not cursor:
             break
     if not frames:
-        raise RuntimeError("Bybit devolvió 0 filas")
+        raise RuntimeError("Bybit returned no data")
     df = pd.concat(frames, ignore_index=True)
     df.columns = ["Open time","Open","High","Low","Close","Volume","Turnover"]
     df = df.astype({c: float for c in ["Open","High","Low","Close","Volume"]})
-    # prevenir FutureWarning → convertir primero a numérico
-    df["Open time"] = pd.to_datetime(
-        pd.to_numeric(df["Open time"]), unit="ms", utc=True
-    )
-    df.sort_values("Open time", inplace=True)
+    df["Open time"] = pd.to_datetime(pd.to_numeric(df["Open time"]), unit="ms", utc=True)
     df.set_index("Open time", inplace=True)
     return df
 
@@ -135,67 +114,39 @@ def build_model(input_shape):
     reg = Dense(1, name="reg_out")(Dense(32, activation="relu")(x))
     cls = Dense(1, activation="sigmoid", name="cls_out")(Dense(32, activation="relu")(x))
     model = Model(inputs, [reg, cls])
-    model.compile(
-        optimizer="adam",
-        loss={"reg_out":"mse", "cls_out":"binary_crossentropy"},
-        metrics={"cls_out":"accuracy"}
-    )
+    model.compile(optimizer="adam", loss={"reg_out":"mse", "cls_out":"binary_crossentropy"}, metrics={"cls_out":"accuracy"})
     return model
 
 model = None
 
 # ────────────────────── 5. TRAIN / LOAD ──────────────────────
 async def train_or_load():
-    """
-    • Carga modelo de disco si coincide la forma
-    • Entrena (o re-entrena) sólo si DO_TRAIN = True
-    """
     global model, scaler
     path = os.path.join(MODEL_DIR, f"btc_l{LOOK_BACK}_h{LOOK_AHEAD_STEPS}.h5")
-
-    # fetch & scale
-    df_hist = fetch_recent_klines(LOOK_BACK + 12_000)
+    df_hist = fetch_recent_klines(LOOK_BACK + 12000)
     scaler.fit(build_feature_df(df_hist))
-
-    # intento de carga
     if os.path.exists(path):
         try:
             mdl = load_model(path, compile=False)
             if mdl.input_shape[1] == LOOK_BACK:
-                mdl.compile(
-                    optimizer="adam",
-                    loss={"reg_out":"mse","cls_out":"binary_crossentropy"},
-                    metrics={"cls_out":"accuracy"}
-                )
+                mdl.compile(optimizer="adam", loss={"reg_out":"mse","cls_out":"binary_crossentropy"}, metrics={"cls_out":"accuracy"})
                 model = mdl
-                print("✓ Modelo cargado desde disco")
+                print("✓ Loaded model from disk")
                 return
-            else:
-                print("⚠ Forma incompatible, se re-entrena")
-        except Exception as e:
-            print(f"⚠ No se pudo cargar modelo: {e}")
-
+        except Exception:
+            print("⚠ Failed to load model, retraining…")
     if not DO_TRAIN:
-        raise RuntimeError("MODELO INEXISTENTE y TRAIN=0 – no hay nada que hacer")
-
-    # — entrenamiento —
+        raise RuntimeError("Model missing and TRAIN=0")
     data = scaler.transform(build_feature_df(df_hist))
     X, y_r, y_c = create_sequences(data)
     split = math.floor(TRAIN_SPLIT_RATIO * len(X))
     X_tr, y_r_tr, y_c_tr = X[:split], y_r[:split], y_c[:split]
     X_val, y_r_val, y_c_val = X[split:], y_r[split:], y_c[split:]
     model = build_model((LOOK_BACK, len(FEATURE_COLUMNS)))
-    callbacks = [
-        EarlyStopping(patience=3, restore_best_weights=True),
-        ModelCheckpoint(path, save_best_only=True)
-    ]
-    print(f"⌛ Entrenando ({len(X_tr):,} muestras)…")
-    model.fit(
-        X_tr, {"reg_out":y_r_tr, "cls_out":y_c_tr},
-        validation_data=(X_val, {"reg_out":y_r_val,"cls_out":y_c_val}),
-        epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=2, callbacks=callbacks
-    )
-    print("✓ Entrenamiento completo")
+    callbacks = [EarlyStopping(patience=3, restore_best_weights=True), ModelCheckpoint(path, save_best_only=True)]
+    print(f"⌛ Training on {len(X_tr):,} samples…")
+    model.fit(X_tr, {"reg_out":y_r_tr, "cls_out":y_c_tr}, validation_data=(X_val,{"reg_out":y_r_val,"cls_out":y_c_val}), epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=2, callbacks=callbacks)
+    print("✓ Training complete")
 
 # ────────────────────── 6. PRED / MONITOR ──────────────────────
 current_pred = {"price":None,"direction":None,"target_time":None}
@@ -206,7 +157,6 @@ def _infer(seq):
     return model(seq, training=False)
 
 async def job_hourly_prediction():
-    """Predicción principal (cada hora)."""
     global current_pred
     df = fetch_recent_klines(LOOK_BACK+1)
     feat = build_feature_df(df)
@@ -217,64 +167,51 @@ async def job_hourly_prediction():
     pred_price = scaler.mean_[idx] + scaler.scale_[idx] * p_s
     pct = (pred_price - last_close) / last_close * 100
     now = datetime.now(timezone.utc)
-    current_pred = {
-        "price":        pred_price,
-        "direction":    pct > 0,
-        "target_time":  now + timedelta(minutes=PRED_HORIZON_MIN)
-    }
-    arrow = "↑" if pct > 0 else "↓"
-    msg = f"BTC 1h ({now:%H:%M UTC}) {arrow} ${pred_price:,.0f} ({pct:+.2f} %)"
+    current_pred = {"price": pred_price, "direction": pct>0, "target_time": now + timedelta(minutes=PRED_HORIZON_MIN)}
+    arrow = "↑" if pct>0 else "↓"
+    msg = f"BTC 1h ({now:%H:%M UTC}) {arrow} ${pred_price:,.0f} ({pct:+.2f}%)"
     ntfy_send(msg, priority="high")
     print("[Pred]", msg, flush=True)
 
 async def job_monitor_deviation():
-    """Comprueba cada MONITOR_FREQ_SEC si el precio real se aleja demasiado."""
     global last_mon, current_pred
-    if current_pred["price"] is None:
-        return
-    if datetime.now(timezone.utc) >= current_pred["target_time"]:
+    if current_pred["price"] is None or datetime.now(timezone.utc) >= current_pred["target_time"]:
         return
     price = fetch_recent_klines(1).iloc[-1]["Close"]
     diff = (price - current_pred["price"]) / current_pred["price"] * 100
-    if abs(diff) < SIGNIFICANT_PCT:
-        return
-    if (datetime.now(timezone.utc) - last_mon).total_seconds() < COOLDOWN_MIN_MONITOR * 60:
+    if abs(diff) < SIGNIFICANT_PCT or (datetime.now(timezone.utc) - last_mon).total_seconds() < COOLDOWN_MIN_MONITOR*60:
         return
     last_mon = datetime.now(timezone.utc)
-    arr = "▲" if diff > 0 else "▼"
-    msg = f"BTC desvío {arr} {diff:+.2f}%  |  ${price:,.0f} vs ${current_pred['price']:,.0f}"
+    arr = "▲" if diff>0 else "▼"
+    msg = f"BTC deviation {arr} {diff:+.2f}% | ${price:,.0f} vs ${current_pred['price']:,.0f}"
     ntfy_send(msg)
     print("[Dev]", msg, flush=True)
 
 # ────────────────────── 7. MAIN ──────────────────────
 async def main():
     warnings.filterwarnings("ignore", category=UserWarning, module="tensorflow")
-    print("🚀 Iniciando BTC-Bot (Railway)…", flush=True)
+    print("🚀 Starting BTC-Bot (Railway)…", flush=True)
 
     await train_or_load()
 
-    # scheduler
     scheduler = AsyncIOScheduler()
-    await job_hourly_prediction()                         # primera predicción inmediata
+    await job_hourly_prediction()
     scheduler.add_job(job_hourly_prediction, 'interval', hours=1, max_instances=1, coalesce=True)
-    scheduler.add_job(job_monitor_deviation, 'interval', seconds=MONITOR_FREQ_SEC,
-                      max_instances=1, coalesce=True)
+    scheduler.add_job(job_monitor_deviation, 'interval', seconds=MONITOR_FREQ_SEC, max_instances=1, coalesce=True)
     if DO_TRAIN:
         scheduler.add_job(train_or_load, 'interval', hours=RETRAIN_EVERY_HRS)
-
     scheduler.start()
-    print(f"✅ Bot activo. NTFY: {NTFY_URL}\n", flush=True)
+    print(f"✅ Bot running. NTFY: {NTFY_URL}", flush=True)
 
-    # mantén vivo el proceso
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         asyncio.get_event_loop().add_signal_handler(sig, stop.set)
     await stop.wait()
-    print("🔌 Apagando…", flush=True)
+    print("🔌 Shutting down…", flush=True)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as e:
-        print(f"❌ Error fatal: {e}", file=sys.stderr)
+        print(f"❌ Fatal error: {e}", file=sys.stderr)
         sys.exit(1)
