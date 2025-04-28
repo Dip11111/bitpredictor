@@ -1,30 +1,8 @@
 """
-BTC‑USDT 1‑Hour Prediction Bot • Bybit Edition (v3)
-==================================================
-Cambia la fuente de datos de **Binance → Bybit** para evitar bloqueos de IP en nubes
-públicas y elimina las notificaciones locales de escritorio (`plyer`).
-
-Puntos clave
-------------
-✔ Sustituido `binance.client` por **pybit** (API REST unificada de Bybit).
-✔ Función `fetch_recent_klines` adaptada al formato de Bybit (timestamps en segundos).
-✔ Dependencia nueva: `pybit` (añade en `requirements.txt`).
-✔ Se quitan todas las llamadas a `plyer.notification` (solo quedan avisos vía ntfy).
-✔ El resto de la lógica (LSTM, scaler, predicción, APScheduler) se mantiene idéntica.
-
-Requisitos (requirements.txt)
------------------------------
-```
-pybit
-pandas
-numpy
-tensorflow-cpu
-scikit-learn
-apscheduler
-requests
-nest_asyncio
-pytz
-```
+BTC-USDT 1-Hour Prediction Bot • Bybit Edition (v3.1)
+===================================================
+Arreglo de FutureWarning: convertimos explícitamente el timestamp a numérico antes de pasar a datetime.
+Añadido mensaje de arranque para confirmar que el bot se inicia.
 """
 
 # ───────────────────────────── 1. CONFIG & SETUP ─────────────────────────────
@@ -83,7 +61,8 @@ def fetch_recent_klines(lookback: int) -> pd.DataFrame:
     cols = ["Open time","Open","High","Low","Close","Volume","Turnover"]
     df = pd.DataFrame(data, columns=cols)
     df = df.astype({c: float for c in ["Open","High","Low","Close","Volume"]})
-    df["Open time"] = pd.to_datetime(df["Open time"], unit="ms", utc=True)
+    # Convertir strings a numérico antes de to_datetime para evitar FutureWarning
+    df["Open time"] = pd.to_datetime(pd.to_numeric(df["Open time"]), unit="ms", utc=True)
     df.sort_values("Open time", inplace=True)
     df.set_index("Open time", inplace=True)
     return df
@@ -126,7 +105,7 @@ def build_model(input_shape):
 
 model = None
 
-# ─────────────── 5. TRAIN / RETRAIN ───────────────
+# ────────────────────── 5. TRAIN / RETRAIN ──────────────────────
 async def train_or_load():
     global model, scaler
     path = os.path.join(MODEL_DIR, f"btc_l{LOOK_BACK}_h{LOOK_AHEAD_STEPS}.h5")
@@ -144,11 +123,11 @@ async def train_or_load():
     X, y_r, y_c = create_sequences(data)
     split = int(TRAIN_SPLIT_RATIO * len(X))
     X_tr, y_r_tr, y_c_tr = X[:split], y_r[:split], y_c[:split]
-    X_val,y_r_val,y_c_val = X[split:],y_r[split:],y_c[split:]
+    X_val, y_r_val, y_c_val = X[split:], y_r[split:], y_c[split:]
     model = build_model((LOOK_BACK, len(FEATURE_COLUMNS)))
-    cb = [EarlyStopping(patience=3, restore_best_weights=True), ModelCheckpoint(path, save_best_only=True)]
+    callbacks = [EarlyStopping(patience=3, restore_best_weights=True), ModelCheckpoint(path, save_best_only=True)]
     print("⌛ Entrenando modelo (1h)…")
-    model.fit(X_tr, {"reg_out":y_r_tr,"cls_out":y_c_tr}, validation_data=(X_val,{"reg_out":y_r_val,"cls_out":y_c_val}), epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=cb, verbose=2)
+    model.fit(X_tr, {"reg_out":y_r_tr,"cls_out":y_c_tr}, validation_data=(X_val,{"reg_out":y_r_val,"cls_out":y_c_val}), epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=2, callbacks=callbacks)
     print("✓ Entrenamiento completo")
 
 # ────────────────────── 6. PRED / MONITOR ──────────────────────
@@ -165,51 +144,76 @@ async def job_hourly_prediction():
     feat = build_feature_df(df)
     seq = scaler.transform(feat)[-LOOK_BACK:].reshape((1,LOOK_BACK,len(FEATURE_COLUMNS)))
     p_s, p_up = _infer(seq)
-    p_s,p_up = float(p_s[0][0]), float(p_up[0][0])
+    p_s, p_up = float(p_s[0][0]), float(p_up[0][0])
     idx = FEATURE_COLUMNS.index("Close")
     last_close = feat.iloc[-1]["Close"]
-    pred_price = scaler.mean_[idx] + scaler.scale_[idx]*p_s
-    pct = (pred_price-last_close)/last_close*100
+    pred_price = scaler.mean_[idx] + scaler.scale_[idx] * p_s
+    pct = (pred_price - last_close) / last_close * 100
     now = datetime.now(timezone.utc)
-    current_pred={"price":pred_price,"direction":pct>0,"target_time":now+timedelta(minutes=PRED_HORIZON_MIN)}
+    current_pred = {"price": pred_price, "direction": pct>0, "target_time": now + timedelta(minutes=PRED_HORIZON_MIN)}
     arrow = "↑" if pct>0 else "↓"
-    msg=f"BTC 1h ({now:%H:%M}) {arrow} ${pred_price:,.0f} ({pct:+.2f}%)"
+    msg = f"BTC 1h ({now:%H:%M UTC}) {arrow} ${pred_price:,.0f} ({pct:+.2f}%)"
     ntfy_send(msg, priority="high")
-    print("[Pred]",msg)
+    print("[Pred]", msg)
 
 async def job_monitor_deviation():
     global last_mon, current_pred
-    if current_pred["price"] is None or datetime.now(timezone.utc)>=current_pred["target_time"]:
+    if current_pred["price"] is None or datetime.now(timezone.utc) >= current_pred["target_time"]:
         return
     price = fetch_recent_klines(1).iloc[-1]["Close"]
-    diff=(price-current_pred["price"]) / current_pred["price"]*100
-    if abs(diff)<SIGNIFICANT_PCT or (datetime.now(timezone.utc)-last_mon).total_seconds()<COOLDOWN_MIN_MONITOR*60:
+    diff = (price - current_pred["price"]) / current_pred["price"] * 100
+    if abs(diff) < SIGNIFICANT_PCT or (datetime.now(timezone.utc) - last_mon).total_seconds() < COOLDOWN_MIN_MONITOR * 60:
         return
-    last_mon=datetime.now(timezone.utc)
-    arr="▲" if diff>0 else "▼"
-    msg=f"BTC desvío {arr} {diff:+.2f}% | ${price:,.0f} vs ${current_pred['price']:,.0f}"        
+    last_mon = datetime.now(timezone.utc)
+    arr = "▲" if diff>0 else "▼"
+    msg = f"BTC desvío {arr} {diff:+.2f}% | ${price:,.0f} vs ${current_pred['price']:,.0f}"
     ntfy_send(msg)
-    print("[Dev]",msg)
+    print("[Dev]", msg)
 
 # ────────────────────── 7. MAIN ──────────────────────
 async def main():
-    warnings.filterwarnings("ignore", category=UserWarning)
+    """Punto de entrada: arranca entrenamientos y jobs periódicos."""
+    warnings.filterwarnings("ignore", category=UserWarning, module="tensorflow")
+    print("🚀 Iniciando BTC 1h Prediction Bot (Bybit)…")
+    # Carga o entrena el modelo inicial
     await train_or_load()
-    sched=AsyncIOScheduler()
+    # Configurar el scheduler
+    scheduler = AsyncIOScheduler()
+    # Predicción base inmediata y luego cada hora
     await job_hourly_prediction()
-    sched.add_job(job_hourly_prediction, "interval", hours=1, max_instances=1, coalesce=True)
-    sched.add_job(job_monitor_deviation, "interval", seconds=MONITOR_FREQ_SEC, max_instances=1, coalesce=True)
-    sched.add_job(train_or_load, "interval", hours=RETRAIN_EVERY_HRS)
-    sched.start()
-    print("✅ Bot activo. ntfy.sh/"+NTFY_TOPIC)
-    while True:
-        await asyncio.sleep(3600)
+    scheduler.add_job(
+        job_hourly_prediction,
+        'interval',
+        hours=1,
+        max_instances=1,
+        coalesce=True
+    )
+    # Monitor de desvíos cada MONITOR_FREQ_SEC segundos
+    scheduler.add_job(
+        job_monitor_deviation,
+        'interval',
+        seconds=MONITOR_FREQ_SEC,
+        max_instances=1,
+        coalesce=True
+    )
+    # Retrain periódico
+    scheduler.add_job(
+        train_or_load,
+        'interval',
+        hours=RETRAIN_EVERY_HRS
+    )
+    scheduler.start()
+    print(f"✅ Bot activo. Recibirás alertas en ntfy.sh/{NTFY_TOPIC}")
 
-if __name__=="__main__":
+    # Mantener vivo el proceso
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        print("🔌 Deteniendo el bot...")
+
+if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except RuntimeError:
-        loop=asyncio.get_event_loop()
-        loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        print("Adiós")
+    except Exception as e:
+        print(f"❌ Error inesperado: {e}")
