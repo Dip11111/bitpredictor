@@ -1,10 +1,9 @@
-python-binance
+pybit
 pandas
 numpy
-tensorflow
+tensorflow-cpu
 scikit-learn
 apscheduler
-plyer
 requests
 nest_asyncio
 pytz
