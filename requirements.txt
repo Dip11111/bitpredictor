@@ -1,0 +1,10 @@
+python-binance
+pandas
+numpy
+tensorflow
+scikit-learn
+apscheduler
+plyer
+requests
+nest_asyncio
+pytz
