@@ -1,6 +1,5 @@
-# Dependencias del bot BTC-USDT 1-H
-pybit==3.7.0          # SDK REST unificado Bybit
-pandas==2.2.2
+pybit==5.10.1
+pandas==2.2.3
 numpy==1.26.4
 tensorflow-cpu==2.19.0
 scikit-learn==1.4.2
